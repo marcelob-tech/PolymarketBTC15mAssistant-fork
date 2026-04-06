@@ -30,6 +30,7 @@ import path from "node:path";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
 import { initTradingClient } from "./trading/client.js";
 import { executeTrade, getTradeCount, resetMarketTradeCount } from "./trading/executor.js";
+import { paperTrade, resolveOpenTrades, getOpenTrade, getPaperTradeCount, resetPaperTradeCount, getStats, canPaperTrade } from "./trading/paper.js";
 
 function countVwapCrosses(closes, vwapSeries, lookback) {
   if (closes.length < lookback || vwapSeries.length < lookback) return null;
@@ -59,6 +60,7 @@ const ANSI = {
   yellow: "\x1b[33m",
   lightRed: "\x1b[91m",
   gray: "\x1b[90m",
+  cyan: "\x1b[36m",
   white: "\x1b[97m",
   dim: "\x1b[2m"
 };
@@ -649,6 +651,7 @@ async function main() {
       const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
       if (marketSlug && lastTradedSlug !== marketSlug) {
         resetMarketTradeCount(lastTradedSlug);
+        resetPaperTradeCount(lastTradedSlug);
         lastTradedSlug = marketSlug;
         lastTradeResult = null;
       }
@@ -698,20 +701,40 @@ async function main() {
         minEdge: CONFIG.trading.minEdge,
       });
 
-      if (CONFIG.trading.enabled && analysis.action === "ENTER" && poly.ok && marketSlug) {
-        const tradeTokenId = analysis.side === "UP" ? poly.tokens.upTokenId : poly.tokens.downTokenId;
-        const tradePrice = analysis.side === "UP" ? poly.prices.up : poly.prices.down;
+      // --- Resolve paper trades when market settles ---
+      if (CONFIG.trading.paperTrade && currentPrice !== null) {
+        resolveOpenTrades(currentPrice);
+      }
 
-        if (tradeTokenId && tradePrice) {
-          const tradeResult = await executeTrade({
+      if (analysis.action === "ENTER" && poly.ok && marketSlug) {
+        const tradePrice = analysis.side === "UP" ? poly.prices.up : poly.prices.down;
+        const endDateMs = poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
+
+        if (CONFIG.trading.paperTrade && tradePrice && canPaperTrade(marketSlug)) {
+          paperTrade({
             side: analysis.side,
-            tokenId: tradeTokenId,
             marketSlug,
-            marketPrice: tradePrice,
-            negRisk: poly.market?.negRisk ?? false,
-            tickSize: poly.market?.orderPriceMinTickSize ?? 0.001,
+            entryPrice: tradePrice,
+            sizeUsdc: CONFIG.trading.sizeUsdc,
+            confidence: analysis.confidence,
+            phase: analysis.phase,
+            strength: analysis.strength,
+            priceToBeat,
+            endDateMs,
           });
-          lastTradeResult = tradeResult;
+        } else if (CONFIG.trading.enabled && !CONFIG.trading.paperTrade) {
+          const tradeTokenId = analysis.side === "UP" ? poly.tokens.upTokenId : poly.tokens.downTokenId;
+          if (tradeTokenId && tradePrice) {
+            const tradeResult = await executeTrade({
+              side: analysis.side,
+              tokenId: tradeTokenId,
+              marketSlug,
+              marketPrice: tradePrice,
+              negRisk: poly.market?.negRisk ?? false,
+              tickSize: poly.market?.orderPriceMinTickSize ?? 0.001,
+            });
+            lastTradeResult = tradeResult;
+          }
         }
       }
 
@@ -791,62 +814,79 @@ async function main() {
               : ANSI.reset)
         : ANSI.reset;
 
+      // --- Build trading lines ---
+      const tradingLines = (() => {
+        if (CONFIG.trading.paperTrade) {
+          const stats = getStats();
+          const open = getOpenTrade(marketSlug);
+          const count = getPaperTradeCount(marketSlug);
+          const max = CONFIG.trading.maxTradesPerMarket;
+          const wrColor = stats.winrate >= 55 ? ANSI.green : stats.winrate >= 45 ? ANSI.yellow : ANSI.red;
+          const pnlColor = stats.pnl >= 0 ? ANSI.green : ANSI.red;
+          const streakStr = stats.streak > 0 ? `${ANSI.green}W${stats.streak}${ANSI.reset}` : stats.streak < 0 ? `${ANSI.red}L${Math.abs(stats.streak)}${ANSI.reset}` : "-";
+
+          let statusLine = `${ANSI.cyan}PAPER${ANSI.reset}`;
+          if (open) {
+            statusLine += ` ${ANSI.yellow}OPEN ${open.side} @ ${open.entryPrice.toFixed(2)}¢ ($${open.sizeUsdc})${ANSI.reset}`;
+          } else {
+            statusLine += ` IDLE`;
+          }
+          statusLine += ` [${count}/${max}]`;
+
+          const statsLine = stats.total > 0
+            ? `W:${stats.wins} L:${stats.losses} | WR: ${wrColor}${stats.winrate.toFixed(1)}%${ANSI.reset} | P&L: ${pnlColor}$${stats.pnl.toFixed(2)}${ANSI.reset} | ${streakStr}`
+            : `${ANSI.gray}No trades yet${ANSI.reset}`;
+
+          return [kv("TRADING:", statusLine), kv("STATS:  ", statsLine)];
+        }
+        if (!CONFIG.trading.enabled) return [kv("TRADING:", `${ANSI.gray}DISABLED${ANSI.reset}`)];
+        const count = getTradeCount(marketSlug);
+        const max = CONFIG.trading.maxTradesPerMarket;
+        if (lastTradeResult?.executed) {
+          const t = lastTradeResult.trade;
+          return [kv("TRADING:", `${ANSI.green}EXECUTED ${t.side} @ $${t.price} ($${t.sizeUsdc})${ANSI.reset} [${count}/${max}]`)];
+        }
+        if (lastTradeResult && !lastTradeResult.executed) {
+          return [kv("TRADING:", `${ANSI.red}FAILED: ${lastTradeResult.reason ?? lastTradeResult.error ?? "-"}${ANSI.reset} [${count}/${max}]`)];
+        }
+        return [kv("TRADING:", `${ANSI.yellow}ENABLED${ANSI.reset} ($${CONFIG.trading.sizeUsdc} USDC) [${count}/${max}]`)];
+      })();
+
+      // --- Analyzer line ---
+      const analyzerLine = (() => {
+        const actionColor = analysis.action === "ENTER"
+          ? (analysis.strength === "STRONG" ? ANSI.green : analysis.strength === "GOOD" ? ANSI.yellow : ANSI.cyan)
+          : ANSI.gray;
+        const confBar = `[${"█".repeat(Math.round(analysis.confidence / 10))}${"░".repeat(10 - Math.round(analysis.confidence / 10))}]`;
+        const sideLabel = analysis.side ? ` ${analysis.side}` : "";
+        const warningText = analysis.warnings.length ? ` ${ANSI.yellow}⚠ ${analysis.warnings.join(", ")}${ANSI.reset}` : "";
+        return kv("ANALYZER:", `${actionColor}${analysis.action}${sideLabel}${ANSI.reset} ${confBar} ${analysis.confidence}% (${analysis.phase})${warningText}`);
+      })();
+
       const lines = [
         titleLine,
         marketLine,
         kv("Time left:", `${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`),
-        "",
         sepLine(),
-        "",
         kv("TA Predict:", predictValue),
         kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
         kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
         kv("MACD:", macdLine.split(": ")[1] ?? macdLine),
         kv("Delta 1/3:", deltaLine.split(": ")[1] ?? deltaLine),
         kv("VWAP:", vwapLine.split(": ")[1] ?? vwapLine),
-        "",
         sepLine(),
-        "",
-        (() => {
-          const actionColor = analysis.action === "ENTER"
-            ? (analysis.strength === "STRONG" ? ANSI.green : analysis.strength === "GOOD" ? ANSI.yellow : ANSI.cyan)
-            : ANSI.gray;
-          const confBar = `[${"█".repeat(Math.round(analysis.confidence / 10))}${"░".repeat(10 - Math.round(analysis.confidence / 10))}]`;
-          const sideLabel = analysis.side ? ` ${analysis.side}` : "";
-          const warningText = analysis.warnings.length ? ` ${ANSI.yellow}⚠ ${analysis.warnings.join(", ")}${ANSI.reset}` : "";
-          return kv("ANALYZER:", `${actionColor}${analysis.action}${sideLabel}${ANSI.reset} ${confBar} ${analysis.confidence}% (${analysis.phase})${warningText}`);
-        })(),
-        "",
+        analyzerLine,
         sepLine(),
-        "",
         kv("POLYMARKET:", polyHeaderValue),
         liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
         settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
         priceToBeat !== null ? kv("PRICE TO BEAT: ", `$${formatNumber(priceToBeat, 0)}`) : kv("PRICE TO BEAT: ", `${ANSI.gray}-${ANSI.reset}`),
         currentPriceLine,
-        "",
         sepLine(),
-        "",
         binanceSpotKvLine,
-        "",
         sepLine(),
-        "",
-        (() => {
-          if (!CONFIG.trading.enabled) return kv("TRADING:", `${ANSI.gray}DISABLED${ANSI.reset}`);
-          const count = getTradeCount(marketSlug);
-          const max = CONFIG.trading.maxTradesPerMarket;
-          if (lastTradeResult?.executed) {
-            const t = lastTradeResult.trade;
-            return kv("TRADING:", `${ANSI.green}EXECUTED ${t.side} @ $${t.price} ($${t.sizeUsdc})${ANSI.reset} [${count}/${max}]`);
-          }
-          if (lastTradeResult && !lastTradeResult.executed) {
-            return kv("TRADING:", `${ANSI.red}FAILED: ${lastTradeResult.reason ?? lastTradeResult.error ?? "-"}${ANSI.reset} [${count}/${max}]`);
-          }
-          return kv("TRADING:", `${ANSI.yellow}ENABLED${ANSI.reset} ($${CONFIG.trading.sizeUsdc} USDC) [${count}/${max}]`);
-        })(),
-        "",
+        ...tradingLines,
         sepLine(),
-        "",
         kv(`${DISPLAY_TZ.replace(/_/g, " ")} | Session:`, `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`)
       ].filter((x) => x !== null);
 

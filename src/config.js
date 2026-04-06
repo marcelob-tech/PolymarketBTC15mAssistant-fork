@@ -32,6 +32,7 @@ export const CONFIG = {
 
   trading: {
     enabled: (process.env.TRADING_ENABLED || "false").toLowerCase() === "true",
+    paperTrade: (process.env.PAPER_TRADE || "false").toLowerCase() === "true",
     privateKey: process.env.WALLET_PRIVATE_KEY || "",
     apiKey: process.env.POLYMARKET_API_KEY || "",
     apiSecret: process.env.POLYMARKET_API_SECRET || "",
