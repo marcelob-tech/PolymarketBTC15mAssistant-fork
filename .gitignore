@@ -2,7 +2,14 @@ node_modules/
 logs/
 .env
 .env.*
+src/.env
 .DS_Store
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+CLAUDE.md
+market.md
+rate-limits.md
+list-markets.md
+list-events.md
+clients-sdks.md

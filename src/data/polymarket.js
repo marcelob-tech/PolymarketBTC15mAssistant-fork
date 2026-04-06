@@ -43,6 +43,8 @@ export async function fetchLiveEventsBySeriesId({ seriesId, limit = 20 }) {
   url.searchParams.set("series_id", String(seriesId));
   url.searchParams.set("active", "true");
   url.searchParams.set("closed", "false");
+  url.searchParams.set("order", "endDate");
+  url.searchParams.set("ascending", "true");
   url.searchParams.set("limit", String(limit));
 
   const res = await fetch(url);
@@ -52,6 +54,64 @@ export async function fetchLiveEventsBySeriesId({ seriesId, limit = 20 }) {
 
   const data = await res.json();
   return Array.isArray(data) ? data : [];
+}
+
+export async function fetchLiveEventsBySeriesSlug({ seriesSlug, limit = 20 }) {
+  const url = new URL("/events", CONFIG.gammaBaseUrl);
+  url.searchParams.set("active", "true");
+  url.searchParams.set("closed", "false");
+  url.searchParams.set("order", "endDate");
+  url.searchParams.set("ascending", "true");
+  url.searchParams.set("limit", String(limit));
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Gamma events(seriesSlug) error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  const events = Array.isArray(data) ? data : [];
+  const slug = String(seriesSlug).toLowerCase();
+  return events.filter((e) => String(e.seriesSlug ?? "").toLowerCase() === slug);
+}
+
+export async function resolveSeriesIdBySlug(seriesSlug) {
+  const slug = String(seriesSlug).toLowerCase();
+
+  // Extract time window tag from slug (e.g. "btc-up-or-down-5m" → "5M", "btc-up-or-down-15m" → "15M")
+  const tagMatch = slug.match(/(\d+m)$/);
+  const tagSlug = tagMatch ? tagMatch[1].toUpperCase() : null;
+
+  // Use tag_slug to find events of this time window, then match seriesSlug
+  if (tagSlug) {
+    const url = new URL("/events", CONFIG.gammaBaseUrl);
+    url.searchParams.set("active", "true");
+    url.searchParams.set("closed", "false");
+    url.searchParams.set("tag_slug", tagSlug);
+    url.searchParams.set("limit", "10");
+
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        const events = Array.isArray(data) ? data : [];
+        for (const e of events) {
+          if (String(e.seriesSlug ?? "").toLowerCase() === slug) {
+            const series = Array.isArray(e.series) ? e.series : [];
+            for (const s of series) {
+              if (String(s.slug ?? "").toLowerCase() === slug) {
+                return String(s.id);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  return null;
 }
 
 export function flattenEventMarkets(events) {
@@ -93,7 +153,7 @@ export function pickLatestLiveMarket(markets, nowMs = Date.now()) {
   const enriched = markets
     .map((m) => {
       const endMs = safeTimeMs(m.endDate);
-      const startMs = safeTimeMs(m.eventStartTime ?? m.startTime ?? m.startDate);
+      const startMs = safeTimeMs(m.eventStartTime ?? m.startTime);
       return { m, endMs, startMs };
     })
     .filter((x) => x.endMs !== null);
